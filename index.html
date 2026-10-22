@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chat With Your PDF</title>
+<style>
+  :root {
+    --bg: #f6f4ff; --card: #ffffff; --text: #1d1b2e; --muted: #6b6880;
+    --primary: #7c5cff; --border: #e2ddf5; --user: #7c5cff; --bot: #efeafe;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #14122a; --card: #1d1a38; --text: #f1eeff; --muted: #a7a2c6;
+            --border: #302c58; --bot: #272347; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, Segoe UI, Roboto, sans-serif;
+         background: var(--bg); color: var(--text); }
+  .wrap { max-width: 860px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 1.4rem; margin: 4px 0; }
+  .sub { color: var(--muted); font-size: .9rem; margin: 0 0 14px; }
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: 14px; padding: 14px; margin-bottom: 12px; }
+  .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  input[type=file] { flex: 1; min-width: 200px; color: var(--text); }
+  #status { color: var(--muted); font-size: .9rem; margin-top: 8px; min-height: 1.2em; }
+  #chat { height: 360px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .msg { padding: 9px 12px; border-radius: 12px; max-width: 85%;
+         white-space: pre-wrap; line-height: 1.45; font-size: .95rem; }
+  .user { background: var(--user); color: #fff; align-self: flex-end; }
+  .bot { background: var(--bot); align-self: flex-start; }
+  .src { display: block; margin-top: 6px; font-size: .78rem; color: var(--muted); }
+  form { display: flex; gap: 8px; margin-top: 10px; }
+  input[type=text] { flex: 1; padding: 11px 12px; border-radius: 10px; font-size: .95rem;
+         border: 1px solid var(--border); background: var(--card); color: var(--text); }
+  button { padding: 11px 18px; border: 0; border-radius: 10px; background: var(--primary);
+           color: #fff; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  .foot { color: var(--muted); font-size: .78rem; text-align: center; margin-top: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Chat With Your PDF</h1>
+  <p class="sub">Upload a PDF (max 10 MB, 50 pages) and ask questions. Answers come only from your document.
+     Built by <b>Shamiema Shahzad</b>.</p>
+
+  <div class="card">
+    <div class="row"><input id="file" type="file" accept="application/pdf"></div>
+    <div id="status">Waiting for a PDF... (first time the AI model downloads, ~25 MB, so it can take a minute)</div>
+  </div>
+
+  <div class="card">
+    <div id="chat"></div>
+    <form id="form">
+      <input id="q" type="text" maxlength="500" placeholder="Ask a question about your document..." autocomplete="off" disabled>
+      <button id="send" disabled>Send</button>
+    </form>
+  </div>
+  <div class="foot">Your PDF is read inside your browser and is never uploaded or stored.
+     Only the few relevant text snippets are sent to the AI to write the answer.</div>
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script type="module">
+import { pipeline, env } from "https://cdn.jsdelivr.net/npm/@xenova/transformers@2.17.2";
+// >>> CHANGE THIS to your Cloudflare Worker URL <<<
+const WORKER_URL = "https://pdf-chat-proxy.shamiemashahzad454.workers.dev";
+const MAX_MB = 10, MAX_PAGES = 50, CHUNK_SIZE = 1000, CHUNK_OVERLAP = 200, TOP_K = 4;
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+env.allowLocalModels = false;
+const $ = (id) => document.getElementById(id);
+const fileEl = $("file"), statusEl = $("status"), chatEl = $("chat"),
+      formEl = $("form"), qEl = $("q"), sendEl = $("send");
+let extractor = null;
+let chunks = [];      // [{page, text}]
+let vectors = null;   // Float32Array (n * dim)
+let dim = 384;
+const setStatus = (t) => (statusEl.textContent = t);
+function addMsg(text, who, sources) {
+  const d = document.createElement("div");
+  d.className = "msg " + who;
+  d.textContent = text;
+  if (sources) {
+    const s = document.createElement("span");
+    s.className = "src";
+    s.textContent = "Sources (pages): " + sources.join(", ");
+    d.appendChild(s);
+  }
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return d;
+}
+function splitText(text) {
+  text = text.replace(/\s+/g, " ").trim();
+  const out = [];
+  let start = 0;
+  while (start < text.length) {
+    const end = Math.min(start + CHUNK_SIZE, text.length);
+    out.push(text.slice(start, end));
+    if (end === text.length) break;
+    start = end - CHUNK_OVERLAP;
+  }
+  return out;
+}
+async function getExtractor() {
+  if (!extractor) {
+    extractor = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2", {
+      progress_callback: (p) => {
+        if (p.status === "progress" && p.progress != null)
+          setStatus(`Downloading AI model... ${Math.round(p.progress)}%`);
+      },
+    });
+  }
+  return extractor;
+}
+async function embed(texts) {
+  const ex = await getExtractor();
+  const out = await ex(texts, { pooling: "mean", normalize: true });
+  dim = out.dims[1];
+  return out.data; // Float32Array
+}
+fileEl.addEventListener("change", async () => {
+  const file = fileEl.files[0];
+  qEl.disabled = sendEl.disabled = true;
+  chunks = []; vectors = null; chatEl.innerHTML = "";
+  if (!file) return;
+  if (file.size > MAX_MB * 1024 * 1024) return setStatus(`File is too big. Max size is ${MAX_MB} MB.`);
+  try {
+    setStatus("Reading PDF...");
+    const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+    if (pdf.numPages > MAX_PAGES) return setStatus(`Too many pages. Max is ${MAX_PAGES} pages.`);
+    for (let p = 1; p <= pdf.numPages; p++) {
+      const page = await pdf.getPage(p);
+      const content = await page.getTextContent();
+      const text = content.items.map((i) => i.str).join(" ");
+      for (const piece of splitText(text)) chunks.push({ page: p, text: piece });
+    }
+    if (!chunks.length) return setStatus("No text found. This may be a scanned PDF (images only).");
+    await getExtractor();
+    const all = new Float32Array(chunks.length * 384);
+    const BATCH = 16;
+    for (let i = 0; i < chunks.length; i += BATCH) {
+      setStatus(`Understanding your document... ${Math.min(i + BATCH, chunks.length)}/${chunks.length}`);
+      const batch = chunks.slice(i, i + BATCH).map((c) => c.text);
+      const data = await embed(batch);
+      all.set(data, i * dim);
+    }
+    vectors = all;
+    setStatus(`Ready! Read ${pdf.numPages} page(s), made ${chunks.length} chunks. Ask your questions below.`);
+    qEl.disabled = sendEl.disabled = false;
+    qEl.focus();
+  } catch (e) {
+    console.error(e);
+    setStatus("Could not read this PDF. Please try another file.");
+  }
+});
+function topK(qVec) {
+  const scores = [];
+  for (let i = 0; i < chunks.length; i++) {
+    let s = 0;
+    const off = i * dim;
+    for (let d = 0; d < dim; d++) s += qVec[d] * vectors[off + d];
+    scores.push([s, i]);
+  }
+  scores.sort((a, b) => b[0] - a[0]);
+  return scores.slice(0, TOP_K).map((x) => chunks[x[1]]);
+}
+formEl.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const q = qEl.value.trim();
+  if (!q || !vectors) return;
+  qEl.value = "";
+  addMsg(q, "user");
+  qEl.disabled = sendEl.disabled = true;
+  const pending = addMsg("Thinking...", "bot");
+  try {
+    const qVec = await embed([q]);
+    const hits = topK(qVec);
+    const context = hits.map((h) => h.text).join("\n\n");
+    const pages = [...new Set(hits.map((h) => h.page))].sort((a, b) => a - b);
+    const res = await fetch(WORKER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question: q, context }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.answer) throw new Error(data.error || "failed");
+    pending.remove();
+    addMsg(data.answer, "bot", pages);
+  } catch (err) {
+    console.error(err);
+    pending.textContent = "Sorry, the AI service is busy or unavailable right now. Please try again in a minute.";
+  } finally {
+    qEl.disabled = sendEl.disabled = false;
+    qEl.focus();
+  }
+});
+</script>
+</body>
+</html>
