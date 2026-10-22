@@ -87,7 +87,7 @@ export default {
       if (!res.ok) {
         const detail = await res.text();
         console.error("Groq error", res.status, detail);   // Observability mein asli error dikhega
-        return json({ error: "LLM service error", status: res.status, detail: detail.slice(0, 300) }, 502, origin);
+        return json({ error: "LLM service error" }, 502, origin);
       }
 
       const data = await res.json();
